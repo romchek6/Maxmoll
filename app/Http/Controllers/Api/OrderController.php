@@ -100,7 +100,12 @@ class OrderController extends Controller
         return response()->json(['success' => 'Заказ успешно создан'], 200);
     }
 
-    public function update($id, Request $request)
+    /**
+     * Обновляет данные у заказа
+     *
+     * @return JsonResponse
+     */
+    public function update($id, Request $request): JsonResponse
     {
         try {
             $validatedData = $request->validate([
@@ -120,109 +125,145 @@ class OrderController extends Controller
             return response()->json(['errors' => 'Заказ не найден']);
         }
 
-        // количество ошибок
-        $exception = 0;
-
-        // проверяем на наличие id склада, и если он есть проверяем
-        // достаточно ли товаров на новом складе
         if (!empty($validatedData['warehouse_id'])) {
+            // Проверка наличия товаров на новом складе
+            $exception = $this->checkWarehouseItems($validatedData, $order);
 
-            if (!empty($validatedData['items'])) {
-                foreach ($validatedData['items'] as $item) {
-
-                    $stock = Stock::query()->where('product_id', $item['product_id'])
-                        ->where('warehouse_id', $validatedData['warehouse_id']);
-
-                    if ($stock->stock < $item['count']) {
-                        $exception++;
-                        break;
-                    }
-                }
-            } else {
-                $orderItems = OrderItem::query()->where('order_id', $order->id)->get();
-
-                if (!empty($orderItems)) {
-                    foreach ($orderItems as $orderItem) {
-                        $stock = Stock::query()->where('product_id', $orderItem['product_id'])
-                            ->where('warehouse_id', $validatedData['warehouse_id']);
-
-                        if ($stock->stock < $orderItem['count']) {
-                            $exception++;
-                            break;
-                        }
-                    }
-                }
-
-            }
-
-            // если какого то товара не достаточно, возвращаем ошибку
+            // Если какого-то товара нет на новом складе, вернуть ошибку
             if ($exception > 0) {
                 return response()->json(['errors' => 'Недостаточно товара на складе'], 400);
             }
 
-            $order->update(['customer' => $validatedData['warehouse_id']]);
+            // Обновить склад заказа на новый
+            $this->updateOrderWarehouse($order, $validatedData['warehouse_id']);
+
+            $this->UpdateNewItems($validatedData['items'], $validatedData['warehouse_id']);
+
+            // Вернуть старые товары на предыдущий склад
+            $this->returnOldItemsToWarehouse($order);
         }
 
-        if (!empty($validatedData['items'])) {
-            // проверяем можно есть ли нужное кол. новых товаров
-            foreach ($validatedData['items'] as $item) {
-                $stock = Stock::query()->where('product_id', $item['product_id'])
-                    ->where('warehouse_id', $order->warehouse_id)
-                    ->first();
+        if (!empty($validatedData['items']) && empty($validatedData['warehouse_id'])) {
 
-                // проверка количество продукта на складе
-                if (empty($stock) || $stock->stock < $item['count']) {
-                    $exception++;
-                    break;
-                }
-            }
+            $exception = $this->checkWarehouseItems($validatedData, $order);
 
             if ($exception > 0) {
                 return response()->json(['errors' => 'Недостаточно товара на складе'], 400);
             }
 
-            // удаляем все позиции заказа и возвращаем на склады
-            $oldItems = $order->orderItems()->get();
-            foreach ($oldItems as $item) {
-                $stock = Stock::query()
-                    ->where('product_id', $item['product_id'])
-                    ->where('warehouse_id', $order->warehouse_id)
-                    ->first();
+            $this->returnOldItemsToWarehouse($order);
 
-                if (!empty($stock)) {
-                    Stock::query()
-                        ->where('product_id', $item['product_id'])
-                        ->where('warehouse_id', $order->warehouse_id)
-                        ->update([
-                            'stock' => $stock->stock + $item->count
-                        ]);
-                }
-            }
-            // удаляем все старые позиции заказа
-            $order->orderItems()->delete();
-
-            // добавляем новые товары в заказ
-            foreach ($validatedData['items'] as $item) {
-                $stock = Stock::query()
-                    ->where('product_id', $item['product_id'])
-                    ->where('warehouse_id', $order->warehouse_id)
-                    ->first();
-                OrderItem::query()->create([
-                    'order_id' => $order->id,
-                    'product_id' => $item['product_id'],
-                    'count' => $item['count'],
-                ]);
-                Stock::query()
-                    ->where('product_id', $item['product_id'])
-                    ->where('warehouse_id', $order->warehouse_id)
-                    ->update([
-                        'stock' => $stock->stock - $item['count']
-                    ]);
-            }
+            $this->UpdateNewItems($validatedData['items'], $validatedData['warehouse_id']);
         }
 
         if (!empty($validatedData['customer'])) $order->update(['customer' => $validatedData['customer']]);
 
         return response()->json(['success' => 'Данные заказа обновлены']);
     }
+
+    /**
+     * Проверяет наличие товаров на складе
+     *
+     * @return int
+     */
+    protected function checkWarehouseItems($validatedData, $order): int
+    {
+        $exception = 0;
+
+        $warehouse = $validatedData['warehouse_id'] ?? $order->warhouse_id;
+
+        // если с новым складом пришли новые товары
+        if (!empty($validatedData['items'])) {
+            foreach ($validatedData['items'] as $item) {
+
+                $stock = Stock::query()->where('product_id', $item['product_id'])
+                    ->where('warehouse_id', $warehouse)
+                    ->first();
+
+                if (!$stock || $stock->stock < $item['count']) {
+                    $exception++;
+                    break;
+                }
+            }
+        } else {
+            // если изменился только склад
+            $orderItems = OrderItem::query()->where('order_id', $order->id)->get();
+
+            if (!empty($orderItems)) {
+                foreach ($orderItems as $orderItem) {
+                    $stock = Stock::query()->where('product_id', $orderItem['product_id'])
+                        ->where('warehouse_id', $warehouse)
+                        ->first();
+
+                    if (!$stock || $stock->stock < $orderItem['count']) {
+                        $exception++;
+                        break;
+                    }
+                }
+            }
+        }
+
+        return $exception;
+    }
+
+    /**
+     * Обновляет склад
+     *
+     * @return int
+     */
+    protected function updateOrderWarehouse($order, $newWarehouseId): void
+    {
+        $order->update(['warehouse_id' => $newWarehouseId]);
+    }
+
+    /**
+     * Возвращает старые товары на склад
+     *
+     * @return int
+     */
+    protected function returnOldItemsToWarehouse($order): void
+    {
+        // удаляем все позиции заказа и возвращаем на склады
+        $oldItems = $order->orderItems()->get();
+        foreach ($oldItems as $item) {
+            $stock = Stock::query()
+                ->where('product_id', $item['product_id'])
+                ->where('warehouse_id', $order->warehouse_id)
+                ->first();
+
+            if (!empty($stock)) {
+                Stock::query()
+                    ->where('product_id', $item['product_id'])
+                    ->where('warehouse_id', $order->warehouse_id)
+                    ->update([
+                        'stock' => $stock->stock + $item->count
+                    ]);
+            }
+        }
+        // удаляем все старые позиции заказа
+        $order->orderItems()->delete();
+    }
+
+    /**
+     * Берёт новые товары со склада
+     *
+     * @return int
+     */
+    protected function UpdateNewItems($newItems, $warehouseId): void
+    {
+        if (!empty($newItems)) {
+            foreach ($newItems as $newItem) {
+                $stock = Stock::query()->where('product_id', $newItem['product_id'])
+                    ->where('warehouse_id', $warehouseId)
+                    ->first();
+
+                if ($stock) {
+                    // Обновить информацию о товаре на текущем складе
+                    $stock->stock += $newItem['count'];
+                    $stock->save();
+                }
+            }
+        }
+    }
+
 }
